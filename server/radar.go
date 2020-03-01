@@ -7,38 +7,39 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func (p *Switchor) radarLoop() {
+func (s *Switchor) radarLoop() {
 	logrus.Debug("====> enter radarLoop")
 	defer logrus.Debug("====> leave radarLoop")
 
-	go p.backgroundConnectRadar()
-	p.radarReconnectTrigger()
+	go s.backgroundConnectRadar()
+	s.radarReconnectTrigger()
 
 loop:
 	select {
-	case <-p.stopCh:
+	case <-s.stopCh:
 		return
-
-	case <-p.connectedRadarCh:
-
+	case <-s.connectedRadarCh:
 		goto loop
 	}
+
+	// FIXME: 对比 electorLoop ，这里似乎缺少主逻辑
+	// radar 对 heartbeat 逻辑是否应该放在这里？
+	// 由于 radar 的 heartbeat 处理编写到 client 库中了，因此
 }
 
-func (p *Switchor) backgroundConnectRadar() {
+func (s *Switchor) backgroundConnectRadar() {
 	for {
 		select {
-		case <-p.stopCh:
+		case <-s.stopCh:
 			return
-
-		case <-p.disconnectedRadarCh:
+		case <-s.disconnectedRadarCh:
 		}
 
 		for {
 
-			logrus.Infof("[switchor] --> try to connect radar[%s]", p.radarHost)
+			logrus.Infof("[switchor] --> try to connect radar[%s]", s.radarHost)
 
-			c := radar.NewRadarClient(p.radarHost, logrus.StandardLogger())
+			c := radar.NewRadarClient(s.radarHost, logrus.StandardLogger())
 
 			// NOTE: block + timeout
 			if err := c.Connect(); err != nil {
@@ -47,28 +48,28 @@ func (p *Switchor) backgroundConnectRadar() {
 				logrus.Infof("[switchor] connect radar success")
 
 				// NOTE: 顺序不能变
-				p.radarCli = c
-				p.connectedRadarCh <- struct{}{}
+				s.radarCli = c
+				s.connectedRadarCh <- struct{}{}
 
 				break
 			}
 
-			time.Sleep(time.Second * time.Duration(p.reconnectPeriod))
+			time.Sleep(time.Second * time.Duration(s.reconnectPeriod))
 		}
 	}
 }
 
-func (p *Switchor) radarReconnectTrigger() {
+func (s *Switchor) radarReconnectTrigger() {
 	select {
-	case p.disconnectedRadarCh <- struct{}{}:
+	case s.disconnectedRadarCh <- struct{}{}:
 		logrus.Debugf("[switchor] trigger connection to [radar]")
 	default:
 		logrus.Debugf("[switchor] connection process is ongoing")
 	}
 }
 
-func (p *Switchor) disconnectRadar() {
-	if p.radarCli != nil {
-		p.radarCli.Close()
+func (s *Switchor) disconnectRadar() {
+	if s.radarCli != nil {
+		s.radarCli.Disconnect()
 	}
 }
