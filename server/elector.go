@@ -10,21 +10,21 @@ import (
 	"google.golang.org/grpc"
 )
 
-func (p *Switchor) electorLoop() {
+func (s *Switchor) electorLoop() {
 	logrus.Debug("====> enter electorLoop")
 	defer logrus.Debug("====> leave electorLoop")
 
-	go p.backgroundConnectElector()
-	p.electorReconnectTrigger()
+	go s.backgroundConnectElector()
+	s.electorReconnectTrigger()
 
-	ticker := time.NewTicker(time.Duration(p.checkPeriod) * time.Second)
+	ticker := time.NewTicker(time.Duration(s.checkPeriod) * time.Second)
 
 	for {
 		select {
-		case <-p.stopCh:
+		case <-s.stopCh:
 			return
 
-		case <-p.connectedElectorCh:
+		case <-s.connectedElectorCh:
 		}
 
 		var curRole, prevRole pb.EnumRole
@@ -37,10 +37,10 @@ func (p *Switchor) electorLoop() {
 			// step 1: 获取 elector role
 			logrus.Infof("[switchor] --> send [Obtain] to elector")
 
-			obRsp, err := p.rsClient.Obtain(context.Background(), &pb.ObtainReq{})
+			obRsp, err := s.rsClient.Obtain(context.Background(), &pb.ObtainReq{})
 			if err != nil {
 				logrus.Infof("[switchor] Obtain role failed: %v", err)
-				p.electorReconnectTrigger()
+				s.electorReconnectTrigger()
 				break
 			}
 
@@ -56,7 +56,13 @@ func (p *Switchor) electorLoop() {
 			} else {
 				counter += 1
 				if counter >= parser.SwitchorSetting.SwitchThreshold {
-					// TODO:通过 channel 发送信号给 operators
+
+					// NOTE: notify curRole if could, or discard
+					select {
+					case s.roleNotifyCh <- curRole:
+					default:
+					}
+
 					logrus.Infof("[switchor] ------> counter => %d (> threshold (%d))", counter, parser.SwitchorSetting.SwitchThreshold)
 				}
 			}
@@ -66,21 +72,21 @@ func (p *Switchor) electorLoop() {
 	}
 }
 
-func (p *Switchor) backgroundConnectElector() {
+func (s *Switchor) backgroundConnectElector() {
 	for {
 		select {
-		case <-p.stopCh:
+		case <-s.stopCh:
 			return
 
-		case <-p.disconnectedElectorCh:
+		case <-s.disconnectedElectorCh:
 		}
 
 		for {
 
-			logrus.Infof("[switchor] --> try to connect elector[%s]", p.rsTcpHost)
+			logrus.Infof("[switchor] --> try to connect elector[%s]", s.rsTcpHost)
 
 			conn, err := grpc.Dial(
-				p.rsTcpHost,
+				s.rsTcpHost,
 				grpc.WithInsecure(),
 				grpc.WithBlock(),
 				grpc.WithTimeout(time.Second),
@@ -92,31 +98,31 @@ func (p *Switchor) backgroundConnectElector() {
 				logrus.Infof("[switchor] connect elector success")
 
 				// NOTE: 顺序不能变
-				p.rsClientConn = conn
-				p.rsClient = pb.NewRoleServiceClient(conn)
+				s.rsClientConn = conn
+				s.rsClient = pb.NewRoleServiceClient(conn)
 
 				// FIXME: another way?
-				p.connectedElectorCh <- struct{}{}
+				s.connectedElectorCh <- struct{}{}
 
 				break
 			}
 
-			time.Sleep(time.Second * time.Duration(p.reconnectPeriod))
+			time.Sleep(time.Second * time.Duration(s.reconnectPeriod))
 		}
 	}
 }
 
-func (p *Switchor) electorReconnectTrigger() {
+func (s *Switchor) electorReconnectTrigger() {
 	select {
-	case p.disconnectedElectorCh <- struct{}{}:
+	case s.disconnectedElectorCh <- struct{}{}:
 		logrus.Debugf("[switchor] trigger connection to [elector]")
 	default:
 		logrus.Debugf("[switchor] connection process is ongoing")
 	}
 }
 
-func (p *Switchor) disconnectElector() {
-	if p.rsClientConn != nil {
-		p.rsClientConn.Close()
+func (s *Switchor) disconnectElector() {
+	if s.rsClientConn != nil {
+		s.rsClientConn.Close()
 	}
 }
