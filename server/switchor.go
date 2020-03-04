@@ -1,6 +1,8 @@
 package server
 
 import (
+	"fmt"
+
 	"github.com/moooofly/dms-switchor/pkg/parser"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
@@ -65,13 +67,12 @@ const (
 )
 
 // FIXME: appName seems useless, just for log info
-// NOTE: 该函数应该命名为 is_role_match() 之类的
 func is_role_match(appName string, ar appRole, er pb.EnumRole) bool {
 	if appRole2electorRole[ar] == er {
-		logrus.Info("[switchor] [%s] appRole(%s) and electorRole(%s) are Matched.", appName, appRole2str[ar], er)
+		logrus.Infof("[switchor] <%s> appRole(%s) and electorRole(%s) --> [Match]", appName, appRole2str[ar], er)
 		return true
 	} else {
-		logrus.Info("[switchor] [%s] appRole(%s) and electorRole(%s) are Mismatched.", appName, appRole2str[ar], er)
+		logrus.Infof("[switchor] <%s> appRole(%s) and electorRole(%s) --> [Mismatch]", appName, appRole2str[ar], er)
 		return false
 	}
 }
@@ -85,8 +86,7 @@ type Operator interface {
 }
 
 type modbOperator struct {
-	radarHost string
-	radarCli  *radar.RadarClient
+	sw *Switchor
 
 	DomainMoid      string
 	MachineRoomMoid string // equal to resourceMoid
@@ -94,9 +94,10 @@ type modbOperator struct {
 	ServerMoid      string // moid
 }
 
-func newModbOperator(rhost, dm, rm, gm, sm string) *modbOperator {
+func newModbOperator(sw *Switchor, dm, rm, gm, sm string) *modbOperator {
 	return &modbOperator{
-		radarHost:       rhost,
+		sw: sw,
+
 		DomainMoid:      dm,
 		MachineRoomMoid: rm, // equal to resourceMoid
 		GroupMoid:       gm,
@@ -126,7 +127,11 @@ func (op *modbOperator) check_modb_role_match(electorRole pb.EnumRole) (bool, er
 	}
 
 	// FIXME: 需要对 radarCli 是否可用做判定，并触发重连
-	rspGroup, err := op.radarCli.GetAppControl([]radar.ReqArgs{a})
+	if op.sw.radarCli == nil {
+		return false, fmt.Errorf("radarCli is nil now, wait some time")
+	}
+
+	rspGroup, err := op.sw.radarCli.GetAppControl([]radar.ReqArgs{a})
 	if err != nil {
 		logrus.Errorf("[switchor] GetAppControl failed: %v", err)
 		return false, err
@@ -151,8 +156,13 @@ func (op *modbOperator) check_modb_role_match(electorRole pb.EnumRole) (bool, er
 }
 
 func (op *modbOperator) switch_modb_role(electorRole pb.EnumRole) {
-	// NOTE: 这应该打印 modb 的 role ，而不是直接 elector role
-	logrus.Info("[switchor] switch role of modb to '%v'", electorRole)
+
+	// FIXME: 是否有必要对 radarCli 是否可用做判定，并主动触发重连？
+	// radar server 的重连已经通过 heartbeat 后台进行
+	if op.sw.radarCli == nil {
+		logrus.Warnf("[switchor] radarCli is <nil>, wait and try again.")
+		return
+	}
 
 	var oper string
 	if electorRole == pb.EnumRole_Leader {
@@ -161,29 +171,33 @@ func (op *modbOperator) switch_modb_role(electorRole pb.EnumRole) {
 		oper = "0" // disabled
 	}
 
-	// FIXME: 需要对 radarCli 是否可用做判定，并触发重连
-	ok, err := op.radarCli.SetAppControl(oper, op.DomainMoid, op.MachineRoomMoid, op.GroupMoid, op.ServerMoid, "modb")
+	ok, err := op.sw.radarCli.SetAppControl(oper, op.DomainMoid, op.MachineRoomMoid, op.GroupMoid, op.ServerMoid, "modb")
 	if err != nil {
-		logrus.Errorf("[switchor] SetAppControl failed: %v", err)
+		logrus.Errorf("[switchor] switch modb role failed: %v", err)
 		return
 	}
 
+	// FIXME: 实现的丑陋
 	if ok {
-		logrus.Info("[switchor] switch role of modb success")
+		logrus.Info("[switchor] switch role of modb to '%v' success", appRole2str[electorRole2appRole[electorRole]])
 	} else {
-		logrus.Warn("[switchor] switch role of modb failed")
+		logrus.Warnf("[switchor] switch role of modb to '%v' failed", appRole2str[electorRole2appRole[electorRole]])
 	}
 }
 
 type redisOperator struct {
+	sw *Switchor
+
 	LocalAddr      string
 	LocalPassword  string
 	RemoteAddr     string
 	RemotePassword string
 }
 
-func newRedisOperator(la, lp, ra, rp string) *redisOperator {
+func newRedisOperator(sw *Switchor, la, lp, ra, rp string) *redisOperator {
 	return &redisOperator{
+		sw: sw,
+
 		LocalAddr:      la,
 		LocalPassword:  lp,
 		RemoteAddr:     ra,
@@ -209,6 +223,8 @@ func (op *redisOperator) switch_redis_role(electorRole pb.EnumRole) {
 }
 
 type mysqlOperator struct {
+	sw *Switchor
+
 	LocalAddr      string
 	LocalUser      string
 	LocalPassword  string
@@ -220,8 +236,10 @@ type mysqlOperator struct {
 	SyncTimeout int
 }
 
-func newMySQLOperator(la, lu, lp, ra, ru, rp string, ct, st int) *mysqlOperator {
+func newMySQLOperator(sw *Switchor, la, lu, lp, ra, ru, rp string, ct, st int) *mysqlOperator {
 	return &mysqlOperator{
+		sw: sw,
+
 		LocalAddr:      la,
 		LocalUser:      lu,
 		LocalPassword:  lp,
@@ -275,6 +293,8 @@ type Switchor struct {
 	connectedRadarCh   chan struct{}
 	connectedElectorCh chan struct{}
 
+	roleNotifyCh chan pb.EnumRole
+
 	stopCh chan struct{}
 }
 
@@ -300,6 +320,8 @@ func NewSwitchor() *Switchor {
 	s.connectedRadarCh = make(chan struct{}, 1)
 	s.connectedElectorCh = make(chan struct{}, 1)
 
+	s.roleNotifyCh = make(chan pb.EnumRole)
+
 	s.stopCh = make(chan struct{})
 
 	return s
@@ -310,7 +332,6 @@ func (s *Switchor) Start() error {
 	go s.electorLoop()
 	go s.radarLoop()
 
-	// FIXME: 放在这里 or 放在 NewSwitchor 中？
 	s.create_operators()
 	s.start_operators()
 
@@ -325,27 +346,47 @@ func (s *Switchor) Stop() {
 	s.disconnectRadar()
 }
 
+// FIXME: 可以进一步抽象
 func (op *modbOperator) operatorLoop() {
-	// 获取当前 electorRole
-	var electorRole pb.EnumRole
-	op.check_and_switch(electorRole)
+	for {
+		select {
+		case <-op.sw.stopCh:
+			return
+
+		case curRole := <-op.sw.roleNotifyCh:
+			logrus.Infof("[switchor] <modbOperator> obtain elector curRole ==> %v", curRole)
+			op.check_and_switch(curRole)
+		}
+	}
 }
 
 func (op *redisOperator) operatorLoop() {
-	// 获取当前 electorRole
-	var electorRole pb.EnumRole
-	op.check_and_switch(electorRole)
+	for {
+		select {
+		case <-op.sw.stopCh:
+			return
+
+		case curRole := <-op.sw.roleNotifyCh:
+			logrus.Infof("[switchor] <redisOperator> obtain elector curRole ==> %v", curRole)
+			op.check_and_switch(curRole)
+		}
+	}
 }
 
 func (op *mysqlOperator) operatorLoop() {
-	// 获取当前 electorRole
-	var electorRole pb.EnumRole
-	op.check_and_switch(electorRole)
+	for {
+		select {
+		case <-op.sw.stopCh:
+			return
+
+		case curRole := <-op.sw.roleNotifyCh:
+			logrus.Infof("[switchor] <mysqlOperator> obtain elector curRole ==> %v", curRole)
+			op.check_and_switch(curRole)
+		}
+	}
 }
 
 func (s *Switchor) start_operators() {
-	// 针对每个 operator 启动一个 goroutine 运行对应的 check_and_switch
-	// 之后通过 channel 触发调用
 
 	if op, ok := s.operators["modb"]; ok {
 		go op.(*modbOperator).operatorLoop()
@@ -364,11 +405,11 @@ func (s *Switchor) create_operators() {
 	case "single-point":
 		// NOTE: only for keeping modb state right when changing mode from
 		// master-slave or cluster to single-point
-
 		_, ok := parser.OperatorRegistry["modb"]
 		if ok {
 			op := newModbOperator(
-				parser.SwitchorSetting.RadarHost,
+				s,
+
 				parser.ModbSetting.DomainMoid,
 				parser.ModbSetting.MachineRoomMoid,
 				parser.ModbSetting.GroupMoid,
@@ -387,7 +428,7 @@ func (s *Switchor) create_operators() {
 		_, ok = parser.OperatorRegistry["modb"]
 		if ok {
 			op := newModbOperator(
-				parser.SwitchorSetting.RadarHost,
+				s,
 
 				parser.ModbSetting.DomainMoid,
 				parser.ModbSetting.MachineRoomMoid,
@@ -405,6 +446,8 @@ func (s *Switchor) create_operators() {
 		_, ok = parser.OperatorRegistry["redis"]
 		if ok {
 			op := newRedisOperator(
+				s,
+
 				parser.RedisSetting.LocalAddr,
 				parser.RedisSetting.LocalPassword,
 				parser.RedisSetting.RemoteAddr,
@@ -421,6 +464,8 @@ func (s *Switchor) create_operators() {
 		_, ok = parser.OperatorRegistry["mysql"]
 		if ok {
 			op := newMySQLOperator(
+				s,
+
 				parser.MySQLSetting.LocalAddr,
 				parser.MySQLSetting.LocalUser,
 				parser.MySQLSetting.LocalPassword,
