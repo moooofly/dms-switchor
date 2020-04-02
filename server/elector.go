@@ -32,26 +32,28 @@ func (s *Switchor) electorLoop() {
 
 		for range ticker.C {
 
-			logrus.Infof("[switchor]    --------")
+			logrus.Debugf("[switchor]    --------")
 
 			// step 1: 获取 elector role
-			logrus.Infof("[switchor] --> send [Obtain] to elector")
+			logrus.Debugf("[switchor] --> send [Obtain] to elector")
 
 			obRsp, err := s.rsClient.Obtain(context.Background(), &pb.ObtainReq{})
 			if err != nil {
-				logrus.Infof("[switchor] Obtain role failed: %v", err)
+				logrus.Warnf("[switchor] Obtain role failed: %v", err)
 				s.electorReconnectTrigger()
 				break
 			}
 
-			logrus.Infof("[switchor] <-- recv [Obtain] Resp, role => [%s]", obRsp.GetRole())
+			logrus.Debugf("[switchor] <-- recv [Obtain] Resp, role => [%s]", obRsp.GetRole())
 
 			// step 2: 若自己所属的 elector 发生了 role 变更，则根据策略触发业务的 switch 动作
 			// NOTE: 由于默认值的关系，preRole 初始值总是 Candidate
 			// FIXME: 考虑设置初始值为 Follower
 			prevRole, curRole = curRole, obRsp.GetRole()
 			if prevRole != curRole {
-				logrus.Infof("[switchor]     role change, last [%s] --> current [%s]", prevRole, curRole)
+				logrus.Info("[switchor] ---------------------------------------------------------------------------")
+				logrus.Infof("[switchor] <<…(⊙_⊙;)…>> elector's role changed, last [%s] --> current [%s]", prevRole, curRole)
+				logrus.Info("[switchor] ---------------------------------------------------------------------------")
 				counter = 1
 			} else {
 				counter += 1
@@ -63,11 +65,11 @@ func (s *Switchor) electorLoop() {
 					default:
 					}
 
-					logrus.Infof("[switchor] ------> counter => %d (> threshold (%d))", counter, parser.SwitchorSetting.SwitchThreshold)
+					logrus.Debugf("[switchor] ------> counter => %d (> threshold (%d))", counter, parser.SwitchorSetting.SwitchThreshold)
 				}
 			}
 
-			logrus.Infof("[switchor]    --------")
+			logrus.Debugf("[switchor]    --------")
 		}
 	}
 }
@@ -93,9 +95,9 @@ func (s *Switchor) backgroundConnectElector() {
 			)
 			// NOTE: block + timeout
 			if err != nil {
-				logrus.Warnf("[switchor] connect elector failed, reason: %v", err)
+				logrus.Warnf("[switchor] ## connect elector failed, reason: %v", err)
 			} else {
-				logrus.Infof("[switchor] connect elector success")
+				logrus.Infof("[switchor] ## connect elector success")
 
 				// NOTE: 顺序不能变
 				s.rsClientConn = conn

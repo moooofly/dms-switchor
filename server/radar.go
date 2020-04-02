@@ -43,9 +43,9 @@ func (s *Switchor) backgroundConnectRadar() {
 
 			// NOTE: block + timeout
 			if err := c.Connect(); err != nil {
-				logrus.Warnf("[switchor] connect radar failed, reason: %v", err)
+				logrus.Warnf("[switchor] ## connect radar failed, reason: %v", err)
 			} else {
-				logrus.Infof("[switchor] connect radar success")
+				logrus.Infof("[switchor] ## connect radar success")
 
 				// NOTE: 顺序不能变
 				s.radarCli = c
