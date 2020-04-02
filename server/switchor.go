@@ -1,8 +1,11 @@
 package server
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 
+	"github.com/gomodule/redigo/redis"
 	"github.com/moooofly/dms-switchor/pkg/parser"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
@@ -173,15 +176,15 @@ func (op *modbOperator) switch_modb_role(electorRole pb.EnumRole) {
 
 	ok, err := op.sw.radarCli.SetAppControl(oper, op.DomainMoid, op.MachineRoomMoid, op.GroupMoid, op.ServerMoid, "modb")
 	if err != nil {
-		logrus.Errorf("[switchor] switch modb role failed: %v", err)
+		logrus.Errorf("[switchor] radarCli.SetAppControl() failed: %v", err)
 		return
 	}
 
 	// FIXME: 实现的丑陋
 	if ok {
-		logrus.Info("[switchor] switch role of modb to '%v' success", appRole2str[electorRole2appRole[electorRole]])
+		logrus.Info("[switchor] switch modb's 'role to '%v' success", appRole2str[electorRole2appRole[electorRole]])
 	} else {
-		logrus.Warnf("[switchor] switch role of modb to '%v' failed", appRole2str[electorRole2appRole[electorRole]])
+		logrus.Warnf("[switchor] switch modb's 'role to '%v' failed", appRole2str[electorRole2appRole[electorRole]])
 	}
 }
 
@@ -206,20 +209,103 @@ func newRedisOperator(sw *Switchor, la, lp, ra, rp string) *redisOperator {
 }
 
 func (op *redisOperator) check_and_switch(electorRole pb.EnumRole) {
-	match, err := op.check_redis_role_match(electorRole)
+
+	c, err := redis.Dial("tcp", op.LocalAddr)
+	if err != nil {
+		logrus.Warnf("[switchor] connect Redis[%s] failed, %v", op.LocalAddr, err)
+		return
+	} else {
+		logrus.Debugf("[switchor] connect Redis[%s] success", op.LocalAddr)
+	}
+
+	if op.LocalPassword != "" {
+		if _, err := c.Do("AUTH", op.LocalPassword); err != nil {
+			c.Close()
+			logrus.Warnf("[switchor] redis AUTH failed, %v", err)
+			return
+		}
+	}
+	defer c.Close()
+
+	match, err := op.check_redis_role_match(c, electorRole)
 	if err != nil {
 		logrus.Errorf("[switchor] check_redis_role_match() failed (err: %v), need to try again", err)
 	} else {
 		if !match {
-			op.switch_redis_role(electorRole)
+			op.switch_redis_role(c, electorRole)
 		}
 	}
 }
 
-func (op *redisOperator) check_redis_role_match(electorRole pb.EnumRole) (bool, error) {
-	return false, nil
+func isMaster(conn redis.Conn) bool {
+	role, err := getRole(conn)
+	if err != nil || role != "master" {
+		return false
+	}
+	return true
 }
-func (op *redisOperator) switch_redis_role(electorRole pb.EnumRole) {
+
+// getRole is supplied to query an instance (master or slave) for its role.
+// It attempts to use the ROLE command introduced in redis 2.8.12.
+func getRole(c redis.Conn) (string, error) {
+	res, err := c.Do("ROLE")
+	if err != nil {
+		return "", err
+	}
+	rres, ok := res.([]interface{})
+	if ok {
+		return redis.String(rres[0], nil)
+	}
+	return "", errors.New("redigo: can not transform ROLE reply to string")
+}
+
+// addr should be
+// 1. "no one"
+// 2. "<ip> <port>"
+func slaveof(c redis.Conn, addr []string) (string, error) {
+	res, err := c.Do("slaveof", addr[0], addr[1])
+	if err != nil {
+		return "", err
+	}
+	rres, ok := res.(string)
+	if ok {
+		return redis.String(rres, nil)
+	}
+	return "", errors.New("redigo: can not transform SLAVEOF reply to string")
+}
+
+func (op *redisOperator) check_redis_role_match(c redis.Conn, electorRole pb.EnumRole) (bool, error) {
+	var curAppRole appRole
+	if isMaster(c) {
+		curAppRole = appIsMaster
+	} else {
+		curAppRole = appIsSlave
+	}
+	logrus.Debugf("[switchor] <redisOperator> obtain redis role ==> %v", appRole2str[curAppRole])
+
+	return is_role_match("redis", curAppRole, electorRole), nil
+}
+
+func (op *redisOperator) switch_redis_role(c redis.Conn, electorRole pb.EnumRole) {
+
+	switch electorRole {
+	case pb.EnumRole_Leader:
+		if res, err := slaveof(c, []string{"no", "one"}); err != nil {
+			logrus.Warnf("[switchor] do 'SLAVEOF NO ONE' failed, %v", err)
+		} else {
+			logrus.Infof("[switchor] do 'SLAVEOF NO ONE' success, %s", res)
+		}
+	case pb.EnumRole_Follower:
+		addr := strings.Split(op.RemoteAddr, ":")
+		if res, err := slaveof(c, addr); err != nil {
+			logrus.Warnf("[switchor] do 'SLAVEOF %s' failed, %v", strings.Join(addr, " "), err)
+		} else {
+			logrus.Infof("[switchor] do 'SLAVEOF %s' success, %s", strings.Join(addr, " "), res)
+		}
+	case pb.EnumRole_Candidate:
+		logrus.Error("[switchor] elector (golang version) in master-slave mode should not use 'candidate'.")
+	}
+
 }
 
 type mysqlOperator struct {
@@ -354,7 +440,7 @@ func (op *modbOperator) operatorLoop() {
 			return
 
 		case curRole := <-op.sw.roleNotifyCh:
-			logrus.Infof("[switchor] <modbOperator> obtain elector curRole ==> %v", curRole)
+			logrus.Debugf("[switchor] <modbOperator> obtain elector curRole ==> %v", curRole)
 			op.check_and_switch(curRole)
 		}
 	}
@@ -367,7 +453,7 @@ func (op *redisOperator) operatorLoop() {
 			return
 
 		case curRole := <-op.sw.roleNotifyCh:
-			logrus.Infof("[switchor] <redisOperator> obtain elector curRole ==> %v", curRole)
+			logrus.Debugf("[switchor] <redisOperator> obtain elector curRole ==> %v", curRole)
 			op.check_and_switch(curRole)
 		}
 	}
@@ -380,7 +466,7 @@ func (op *mysqlOperator) operatorLoop() {
 			return
 
 		case curRole := <-op.sw.roleNotifyCh:
-			logrus.Infof("[switchor] <mysqlOperator> obtain elector curRole ==> %v", curRole)
+			logrus.Debugf("[switchor] <mysqlOperator> obtain elector curRole ==> %v", curRole)
 			op.check_and_switch(curRole)
 		}
 	}

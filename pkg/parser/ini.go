@@ -85,14 +85,10 @@ func Load() {
 	logrus.Infof("operator registered => %v", OperatorRegistry)
 
 	switch SwitchorSetting.Mode {
-	case "single-point":
-		logrus.Infof("dms mode => [%s]", SwitchorSetting.Mode)
-	case "master-slave":
-		logrus.Infof("dms mode => [%s]", SwitchorSetting.Mode)
-	case "cluster":
-		logrus.Infof("dms mode => [%s]", SwitchorSetting.Mode)
+	case "single-point", "master-slave", "cluster":
+		logrus.Infof("mode setting => [%s]", SwitchorSetting.Mode)
 	default:
-		logrus.Fatal("not match any of [single-point|master-slave|cluster].")
+		logrus.Fatalf("mode '%v' dose not match any of [single-point|master-slave|cluster].", SwitchorSetting.Mode)
 	}
 }
 
