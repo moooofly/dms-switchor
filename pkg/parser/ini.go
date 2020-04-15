@@ -39,19 +39,19 @@ type switchor struct {
 // [redis] section in .ini
 type redis struct {
 	LocalAddr      string `ini:"redis-local-addr"`
-	LocalPassword  string `ini:"redis-local-password"`
+	LocalPassword  string `ini:"redis-local-passwd"`
 	RemoteAddr     string `ini:"redis-remote-addr"`
-	RemotePassword string `ini:"redis-remote-password"`
+	RemotePassword string `ini:"redis-remote-passwd"`
 }
 
 // [mysql] section in .ini
 type mysql struct {
 	LocalAddr      string `ini:"mysql-local-addr"`
 	LocalUser      string `ini:"mysql-local-user"`
-	LocalPassword  string `ini:"mysql-local-password"`
+	LocalPassword  string `ini:"mysql-local-passwd"`
 	RemoteAddr     string `ini:"mysql-remote-addr"`
 	RemoteUser     string `ini:"mysql-remote-user"`
-	RemotePassword string `ini:"mysql-remote-password"`
+	RemotePassword string `ini:"mysql-remote-passwd"`
 
 	ConnTimeout int `ini:"mysql-conn-timeout"`
 	SyncTimeout int `ini:"mysql-sync-timeout"`
@@ -85,14 +85,10 @@ func Load() {
 	logrus.Infof("operator registered => %v", OperatorRegistry)
 
 	switch SwitchorSetting.Mode {
-	case "single-point":
-		logrus.Infof("dms mode => [%s]", SwitchorSetting.Mode)
-	case "master-slave":
-		logrus.Infof("dms mode => [%s]", SwitchorSetting.Mode)
-	case "cluster":
-		logrus.Infof("dms mode => [%s]", SwitchorSetting.Mode)
+	case "single-point", "master-slave", "cluster":
+		logrus.Infof("mode setting => [%s]", SwitchorSetting.Mode)
 	default:
-		logrus.Fatal("not match any of [single-point|master-slave|cluster].")
+		logrus.Fatalf("mode '%v' dose not match any of [single-point|master-slave|cluster].", SwitchorSetting.Mode)
 	}
 }
 
