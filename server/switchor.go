@@ -1,9 +1,13 @@
 package server
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
+
+	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/gomodule/redigo/redis"
 	"github.com/moooofly/dms-switchor/pkg/parser"
@@ -195,6 +199,8 @@ type redisOperator struct {
 	LocalPassword  string
 	RemoteAddr     string
 	RemotePassword string
+
+	c redis.Conn
 }
 
 func newRedisOperator(sw *Switchor, la, lp, ra, rp string) *redisOperator {
@@ -210,29 +216,12 @@ func newRedisOperator(sw *Switchor, la, lp, ra, rp string) *redisOperator {
 
 func (op *redisOperator) check_and_switch(electorRole pb.EnumRole) {
 
-	c, err := redis.Dial("tcp", op.LocalAddr)
-	if err != nil {
-		logrus.Warnf("[switchor] connect Redis[%s] failed, %v", op.LocalAddr, err)
-		return
-	} else {
-		logrus.Debugf("[switchor] connect Redis[%s] success", op.LocalAddr)
-	}
-
-	if op.LocalPassword != "" {
-		if _, err := c.Do("AUTH", op.LocalPassword); err != nil {
-			c.Close()
-			logrus.Warnf("[switchor] redis AUTH failed, %v", err)
-			return
-		}
-	}
-	defer c.Close()
-
-	match, err := op.check_redis_role_match(c, electorRole)
+	match, err := op.check_redis_role_match(electorRole)
 	if err != nil {
 		logrus.Errorf("[switchor] check_redis_role_match() failed (err: %v), need to try again", err)
 	} else {
 		if !match {
-			op.switch_redis_role(c, electorRole)
+			op.switch_redis_role(electorRole)
 		}
 	}
 }
@@ -274,9 +263,9 @@ func slaveof(c redis.Conn, addr []string) (string, error) {
 	return "", errors.New("redigo: can not transform SLAVEOF reply to string")
 }
 
-func (op *redisOperator) check_redis_role_match(c redis.Conn, electorRole pb.EnumRole) (bool, error) {
+func (op *redisOperator) check_redis_role_match(electorRole pb.EnumRole) (bool, error) {
 	var curAppRole appRole
-	if isMaster(c) {
+	if isMaster(op.c) {
 		curAppRole = appIsMaster
 	} else {
 		curAppRole = appIsSlave
@@ -286,21 +275,21 @@ func (op *redisOperator) check_redis_role_match(c redis.Conn, electorRole pb.Enu
 	return is_role_match("redis", curAppRole, electorRole), nil
 }
 
-func (op *redisOperator) switch_redis_role(c redis.Conn, electorRole pb.EnumRole) {
+func (op *redisOperator) switch_redis_role(electorRole pb.EnumRole) {
 
 	switch electorRole {
 	case pb.EnumRole_Leader:
-		if res, err := slaveof(c, []string{"no", "one"}); err != nil {
-			logrus.Warnf("[switchor] do 'SLAVEOF NO ONE' failed, %v", err)
+		if res, err := slaveof(op.c, []string{"no", "one"}); err != nil {
+			logrus.Warnf("[switchor] exec 'SLAVEOF NO ONE' failed, %v", err)
 		} else {
-			logrus.Infof("[switchor] do 'SLAVEOF NO ONE' success, %s", res)
+			logrus.Infof("[switchor] exec 'SLAVEOF NO ONE' success, %s", res)
 		}
 	case pb.EnumRole_Follower:
 		addr := strings.Split(op.RemoteAddr, ":")
-		if res, err := slaveof(c, addr); err != nil {
-			logrus.Warnf("[switchor] do 'SLAVEOF %s' failed, %v", strings.Join(addr, " "), err)
+		if res, err := slaveof(op.c, addr); err != nil {
+			logrus.Warnf("[switchor] exec 'SLAVEOF %s' failed, %v", strings.Join(addr, " "), err)
 		} else {
-			logrus.Infof("[switchor] do 'SLAVEOF %s' success, %s", strings.Join(addr, " "), res)
+			logrus.Infof("[switchor] exec 'SLAVEOF %s' success, %s", strings.Join(addr, " "), res)
 		}
 	case pb.EnumRole_Candidate:
 		logrus.Error("[switchor] elector (golang version) in master-slave mode should not use 'candidate'.")
@@ -320,6 +309,9 @@ type mysqlOperator struct {
 
 	ConnTimeout int
 	SyncTimeout int
+
+	ldb *sql.DB
+	rdb *sql.DB
 }
 
 func newMySQLOperator(sw *Switchor, la, lu, lp, ra, ru, rp string, ct, st int) *mysqlOperator {
@@ -349,10 +341,141 @@ func (op *mysqlOperator) check_and_switch(electorRole pb.EnumRole) {
 	}
 }
 
-func (op *mysqlOperator) check_mysql_role_match(electorRole pb.EnumRole) (bool, error) {
-	return false, nil
+func getReadOnly(db *sql.DB) (error, string) {
+	var name, value string
+	err := db.QueryRow("show global variables like 'read_only'").Scan(&name, &value)
+	if err != nil {
+		logrus.Warnf("[switchor] exec 'show global variables like \"read_only\"' failed, %v", err)
+		return err, ""
+	}
+
+	return nil, value
 }
+
+func setReadOnly(db *sql.DB, to string) bool {
+	_, err := db.Exec(fmt.Sprintf("set global read_only=%s", to))
+	if err != nil {
+		logrus.Warnf("[switchor] exec 'set global read_only=%s' failed, %v", to, err)
+		return false
+	} else {
+		logrus.Infof("[switchor] exec 'set global read_only=%s' success", to)
+		return true
+	}
+}
+
+func (op *mysqlOperator) check_mysql_role_match(electorRole pb.EnumRole) (bool, error) {
+
+	err, ro := getReadOnly(op.ldb)
+	if err != nil {
+		return false, err
+	}
+
+	var curAppRole appRole
+	if ro == "ON" {
+		curAppRole = appIsSlave
+	} else {
+		curAppRole = appIsMaster
+	}
+
+	logrus.Debugf("[switchor] <mysqlOperator> obtain mysql role ==> %v", appRole2str[curAppRole])
+
+	return is_role_match("mysql", curAppRole, electorRole), nil
+}
+
+func masterReplStatus(db *sql.DB) (string, string) {
+	var value [5]string
+	err := db.QueryRow("show master status").Scan(&value)
+	if err != nil {
+		logrus.Warnf("[switchor] 'show master status' failed, %v", err)
+		return "", ""
+	} else {
+		// mysql_master_repl_result_file_index = int32(0)
+		// mysql_master_repl_result_pos_index  = int32(1)
+		return value[0], value[1]
+	}
+}
+
+func slaveReplStatus(db *sql.DB) (string, string) {
+	var value [58]string
+	err := db.QueryRow("show slave status").Scan(&value)
+	if err != nil {
+		logrus.Warnf("[switchor] 'show slave status' failed, %v", err)
+		return "", ""
+	} else {
+		// mysql_slave_repl_result_file_index  = int32(5)
+		// mysql_slave_repl_result_pos_index   = int32(21)
+		return value[5], value[21]
+	}
+}
+
 func (op *mysqlOperator) switch_mysql_role(electorRole pb.EnumRole) {
+
+	switch electorRole {
+	case pb.EnumRole_Leader:
+		/*
+		   steps to switch mysql to master:
+
+		   1. check if read-only flag of remote mysql (old master) has been set (which deny all write ops to
+		      prepare syncing):
+		      if not, or shit happened to mysql, continue looping from 1.
+		      if yes, go to 2.;
+		   2. fetch {File:Position} of command `show master status` on the remote (old master) mysql;
+		   3. fetch {Master_Log_File:Exec_Master_Log_Pos} of command `show slave status` on the local mysql;
+		   4. wait until {File:Position} and {Master_Log_File:Exec_Master_Log_Pos} be the same, or timeout;
+		   5. set read_only=0 no matter whether the sync progress finished or not.
+		*/
+
+		ticker := time.NewTicker(time.Duration(1) * time.Second)
+		syncTimeout := time.After(time.Duration(op.SyncTimeout) * time.Second)
+
+		for {
+			select {
+			case <-syncTimeout:
+				logrus.Warnf("[switchor] sync not complete in %ds, but we still set local mysql 'read_only' to 'OFF'", op.SyncTimeout)
+				setReadOnly(op.ldb, "OFF")
+				return
+
+			case <-ticker.C:
+				var ro string
+				err, ro := getReadOnly(op.rdb)
+				if err != nil {
+					continue
+				}
+
+				if ro == "ON" {
+					// remote mysql 'read_only' is ON
+					file, position := masterReplStatus(op.rdb)
+					if file == "" || position == "" {
+						continue
+					}
+					logrus.Infof("[switchor] remote mysql (master) --> File [%s] Position [%s]", file, position)
+
+					masterLogFile, execMasterLogPos := slaveReplStatus(op.ldb)
+					if masterLogFile == "" || execMasterLogPos == "" {
+						continue
+					}
+					logrus.Infof("[switchor] local mysql (slave) --> Master_Log_File [%s] Exec_Master_Log_Pos [%s]", masterLogFile, execMasterLogPos)
+
+					if file == masterLogFile && position == execMasterLogPos {
+						logrus.Info("[switchor] mysql master-slave in SYNC state")
+					} else {
+						logrus.Info("[switchor] mysql master-slave in un-SYNC state")
+					}
+
+				} else {
+					// NOTE: 原设计中，等待 remote mysql 切换 read_only 为 ON 的时间也被算在 SyncTimeout 时间之中了
+					// 若 remote MySQL 迟迟未切换到 ON ，则真正留给等待同步的时间会很少，可能导致数据丢失
+					logrus.Info("[switchor] remote mysql 'read_only' is still 'OFF', want for changing")
+				}
+			}
+		}
+
+	case pb.EnumRole_Follower:
+		setReadOnly(op.ldb, "ON")
+	case pb.EnumRole_Candidate:
+		logrus.Error("[switchor] elector (golang version) in master-slave mode should not use 'candidate'.")
+	}
+
 }
 
 // Switchor defines the switchor
@@ -447,6 +570,27 @@ func (op *modbOperator) operatorLoop() {
 }
 
 func (op *redisOperator) operatorLoop() {
+
+	// NOTE: do connection job here avoiding to connect redis each loop
+	c, err := redis.Dial("tcp", op.LocalAddr)
+	if err != nil {
+		logrus.Warnf("[switchor] connect Redis[%s] failed, %v", op.LocalAddr, err)
+		return
+	} else {
+		logrus.Debugf("[switchor] connect Redis[%s] success", op.LocalAddr)
+	}
+
+	if op.LocalPassword != "" {
+		if _, err := c.Do("AUTH", op.LocalPassword); err != nil {
+			c.Close()
+			logrus.Warnf("[switchor] redis AUTH failed, %v", err)
+			return
+		}
+	}
+	defer c.Close()
+
+	op.c = c
+
 	for {
 		select {
 		case <-op.sw.stopCh:
@@ -460,6 +604,38 @@ func (op *redisOperator) operatorLoop() {
 }
 
 func (op *mysqlOperator) operatorLoop() {
+
+	// NOTE: do connection job here avoiding to connect local and remote mysql each loop
+	ldb, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/?timeout=%ds&charset=utf8&parseTime=True&loc=Local",
+		op.LocalUser,
+		op.LocalPassword,
+		op.LocalAddr,
+		op.ConnTimeout))
+	if err != nil {
+		logrus.Warnf("[switchor] connect local MySQL[%s] failed, %v", op.LocalAddr, err)
+		return
+	} else {
+		logrus.Debugf("[switchor] connect local MySQL[%s] success", op.LocalAddr)
+	}
+	defer ldb.Close()
+
+	op.ldb = ldb
+
+	rdb, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/?timeout=%ds&charset=utf8&parseTime=True&loc=Local",
+		op.RemoteUser,
+		op.RemotePassword,
+		op.RemoteAddr,
+		op.ConnTimeout))
+	if err != nil {
+		logrus.Warnf("[switchor] connect remote MySQL[%s] failed, %v", op.RemoteAddr, err)
+		return
+	} else {
+		logrus.Debugf("[switchor] connect remote MySQL[%s] success", op.RemoteAddr)
+	}
+	defer rdb.Close()
+
+	op.rdb = rdb
+
 	for {
 		select {
 		case <-op.sw.stopCh:
