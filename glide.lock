@@ -1,5 +1,5 @@
-hash: 0a645218fab7dcbd56a91fdea9355cf14416a3ff8b2ffcd245d556b29614fea9
-updated: 2020-04-17T16:04:34.995069966+08:00
+hash: 4d7a051e9236d52c8b88cf60337066374345eb8992f3b2d4b340a2c23a356b36
+updated: 2020-04-17T17:36:00.83546876+08:00
 imports:
 - name: github.com/alecthomas/template
   version: fb15b899a75114aa79cc930e33c46b577cc664b1
@@ -24,8 +24,10 @@ imports:
   - redis
 - name: github.com/konsorten/go-windows-terminal-sequences
   version: f55edac94c9bbba5d6182a4be46d86a2c9b5b50e
+- name: github.com/mitchellh/mapstructure
+  version: ba04b217da920f27cfc994a979894602990935ad
 - name: github.com/moooofly/radar-go-client
-  version: a2a53338d11d46feaf89778b2919c63aa36c0216
+  version: aea1288e7b143618f64ec1227cd0f0fa5560047e
 - name: github.com/sirupsen/logrus
   version: d417be0fe654de640a82370515129985b407c7e3
 - name: golang.org/x/net
